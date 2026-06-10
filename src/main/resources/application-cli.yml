@@ -1,0 +1,13 @@
+# CLI 模式：关闭 Web 服务器，启动终端 Agent
+spring:
+  main:
+    web-application-type: none
+
+# 代码工具的工作区目录（默认当前目录）
+code:
+  workspace: "."
+
+logging:
+  level:
+    root: WARN
+    org.ai.aihelper.pico: INFO

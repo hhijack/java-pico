@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: ai-helper
+  profiles:
+    include: local
+
+logging:
+  level:
+    root: INFO
+    dev.langchain4j: INFO
+    dev.langchain4j.community.model.dashscope: INFO
+    org.ai.aihelper: DEBUG
+    org.springframework.boot.autoconfigure: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+

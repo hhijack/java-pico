@@ -1,0 +1,35 @@
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+*.swp
+*.swo
+*~
+
+# 包含密钥/密码的配置文件（绝对不要提交！）
+application-local.yml
+.pico/config.json
+
+# 知识库文档
+src/main/resources/docs/
+
+# Agent 运行时工作区
+workspace/
+
+# 日志
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
