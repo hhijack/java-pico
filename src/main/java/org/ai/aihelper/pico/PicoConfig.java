@@ -26,9 +26,16 @@ import java.util.Map;
  */
 public class PicoConfig {
 
-    public final String deepseekApiKey;
-    public final String deepseekBaseUrl;
-    public final String deepseekModel;
+    /** API 密钥（DashScope / DeepSeek 通用） */
+    public final String apiKey;
+    /** API 基础 URL（OpenAI 兼容格式） */
+    public final String baseUrl;
+    /** 路由模型（小模型，负责分类 + 简单对话） */
+    public final String routerModel;
+    /** 中等模型（负责知识库查询 + 联网搜索等常规任务） */
+    public final String mediumModel;
+    /** 最强模型（负责编码、文件操作等复杂任务） */
+    public final String maxModel;
     public final String workspacePath;
     public final String ragUrl;
     public final int maxSteps;
@@ -38,20 +45,38 @@ public class PicoConfig {
         // 尝试从 .pico/config.json 读取（值可能是 String 或 Integer）
         Map<String, Object> fileCfg = loadFileConfig();
 
-        this.deepseekApiKey = first(
+        // 兼容新旧字段名：新版优先，旧版兜底
+        this.apiKey = first(
+                System.getenv("API_KEY"),
+                str(fileCfg.get("api_key")),
                 System.getenv("DEEPSEEK_API_KEY"),
                 str(fileCfg.get("deepseek_api_key")),
                 ""
         );
-        this.deepseekBaseUrl = first(
+        this.baseUrl = first(
+                System.getenv("BASE_URL"),
+                str(fileCfg.get("base_url")),
                 System.getenv("DEEPSEEK_BASE_URL"),
                 str(fileCfg.get("deepseek_base_url")),
-                "https://api.deepseek.com"
+                "https://dashscope.aliyuncs.com/compatible-mode"
         );
-        this.deepseekModel = first(
+        this.routerModel = first(
+                System.getenv("ROUTER_MODEL"),
+                str(fileCfg.get("router_model")),
+                "qwen3-8b"
+        );
+        this.mediumModel = first(
+                System.getenv("MEDIUM_MODEL"),
+                str(fileCfg.get("medium_model")),
+                "qwen3.7-plus"
+        );
+        this.maxModel = first(
+                System.getenv("MAX_MODEL"),
+                str(fileCfg.get("max_model")),
                 System.getenv("DEEPSEEK_MODEL"),
                 str(fileCfg.get("deepseek_model")),
-                "deepseek-v4-flash"
+                str(fileCfg.get("reasoner_model")),
+                "qwen3.7-max"
         );
         this.workspacePath = first(
                 str(fileCfg.get("workspace")),

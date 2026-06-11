@@ -83,6 +83,8 @@ public class DeepSeekClient {
             body.put("model", model);
             body.put("max_tokens", maxNewTokens);
             body.put("temperature", 0.7);
+            // 阿里云 Qwen 模型在非流式调用时必须显式关闭思考模式
+            body.put("enable_thinking", false);
             ArrayNode messages = body.putArray("messages");
             ObjectNode msg = messages.addObject();
             msg.put("role", "user");
@@ -91,12 +93,16 @@ public class DeepSeekClient {
             // 用字节方式发送，确保 UTF-8 编码
             byte[] jsonBytes = json.writeValueAsBytes(body);
 
+            // 构造完整 URL
+            String apiUrl = baseUrl + "/v1/chat/completions";
+
             // 调试：打印实际发送的 prompt（截断）
             String debug = prompt.length() > 60 ? prompt.substring(0, 60) + "..." : prompt;
-            System.out.println("--- [DeepSeek] sending " + jsonBytes.length + " bytes, prompt preview: " + debug + " ---");
+            System.out.println("--- [DeepSeek] POST " + apiUrl + " (" + jsonBytes.length + " bytes) ---");
+            System.out.println("--- [DeepSeek] prompt preview: " + debug + " ---");
 
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl + "/v1/chat/completions"))
+                    .uri(URI.create(apiUrl))
                     .header("Authorization", "Bearer " + apiKey)
                     .header("Content-Type", "application/json; charset=utf-8")
                     .timeout(Duration.ofSeconds(120))

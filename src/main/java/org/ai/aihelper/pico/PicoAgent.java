@@ -72,6 +72,10 @@ public class PicoAgent {
     private static final Pattern TOOL_TAG = Pattern.compile("<tool>(.*?)</tool>", Pattern.DOTALL);
     private static final Pattern FINAL_TAG = Pattern.compile("<final>(.*?)</final>", Pattern.DOTALL);
     private static final Pattern ERROR_TAG = Pattern.compile("<error>(.*?)</error>", Pattern.DOTALL);
+    /** 路由标签：Router 模型用 {@code <route>分类</route>} 输出分类结果 */
+    private static final Pattern ROUTE_TAG = Pattern.compile("<route>(.*?)</route>", Pattern.DOTALL);
+    /** 重路由标签：任意模型输出 {@code <reroute>分类</reroute>} 主动要求切换模型 */
+    private static final Pattern REROUTE_TAG = Pattern.compile("<reroute>(.*?)</reroute>", Pattern.DOTALL);
 
     // ANSI colors
     private static final String C_RESET = "[0m";
@@ -87,8 +91,22 @@ public class PicoAgent {
     // ===================================================================
     //                           依赖注入的成员
     // ===================================================================
-    /** 大模型客户端：负责把 prompt 发到 DeepSeek 并取回文本 */
-    private final DeepSeekClient llm;
+    /** 路由模型客户端（小模型，如 qwen3-8b）：负责意图分类 + 简单对话 */
+    private final DeepSeekClient routerLlm;
+    /** 中等模型客户端（如 qwen3.7-plus）：负责知识库查询、联网搜索 */
+    private final DeepSeekClient mediumLlm;
+    /** 最强模型客户端（如 qwen3.7-max）：负责编码、文件操作等复杂任务 */
+    private final DeepSeekClient maxLlm;
+    /** 路由模型名称 */
+    private final String routerModelName;
+    /** 中等模型名称 */
+    private final String mediumModelName;
+    /** 最强模型名称 */
+    private final String maxModelName;
+    /** 当前正在对话的模型名称（运行时动态切换） */
+    private String currentModelName;
+    /** 上一次路由结果：连续 direct 时可跳过路由，直接回答 */
+    private String lastRoute = null;
     /** 本地文件操作工具集：list_files / read_file / write_file / patch_file / search */
     private final CodeTool codeTool;
     /** 网页搜索工具：处理"实时新闻/最新资讯"类请求 */
@@ -117,23 +135,37 @@ public class PicoAgent {
     /**
      * 构造方法（由 PicoCLI 手动装配；不是 Spring Bean）。
      *
-     * @param llm            DeepSeek HTTP 客户端
-     * @param codeTool       本地文件工具（Spring Bean 注入）
-     * @param webSearchTool  网页搜索工具（Spring Bean 注入）
-     * @param ragRetriever   RAG 检索包装
-     * @param workspaceRoot  工作区根目录，所有文件操作都被 resolve() 限制在此目录下
-     * @param maxSteps       Agent 循环最大步数（防死循环）
-     * @param maxNewTokens   单次 LLM 调用的 max_tokens
+     * @param routerLlm       路由模型客户端（小模型，如 qwen3-8b）
+     * @param mediumLlm       中等模型客户端（如 qwen3.7-plus）
+     * @param maxLlm          最强模型客户端（如 qwen3.7-max）
+     * @param routerModelName 路由模型名（终端显示用）
+     * @param mediumModelName 中等模型名（终端显示用）
+     * @param maxModelName    最强模型名（终端显示用）
+     * @param codeTool        本地文件工具（Spring Bean 注入）
+     * @param webSearchTool   网页搜索工具（Spring Bean 注入）
+     * @param ragRetriever    RAG 检索包装
+     * @param workspaceRoot   工作区根目录
+     * @param maxSteps        Agent 循环最大步数
+     * @param maxNewTokens    单次 LLM 调用的 max_tokens
      */
-    public PicoAgent(DeepSeekClient llm, CodeTool codeTool, WebSearchTool webSearchTool,
-                     RagRetriever ragRetriever, Path workspaceRoot, int maxSteps, int maxNewTokens) {
-        this.llm = llm;
+    public PicoAgent(DeepSeekClient routerLlm, DeepSeekClient mediumLlm, DeepSeekClient maxLlm,
+                     String routerModelName, String mediumModelName, String maxModelName,
+                     CodeTool codeTool, WebSearchTool webSearchTool,
+                     RagRetriever ragRetriever, Path workspaceRoot,
+                     int maxSteps, int maxNewTokens) {
+        this.routerLlm = routerLlm;
+        this.mediumLlm = mediumLlm;
+        this.maxLlm = maxLlm;
+        this.routerModelName = routerModelName;
+        this.mediumModelName = mediumModelName;
+        this.maxModelName = maxModelName;
         this.codeTool = codeTool;
         this.webSearchTool = webSearchTool;
         this.ragRetriever = ragRetriever;
         this.workspaceRoot = workspaceRoot;
         this.maxSteps = maxSteps;
         this.maxNewTokens = maxNewTokens;
+        this.currentModelName = maxModelName;
     }
 
     // ===================================================================
@@ -162,51 +194,260 @@ public class PicoAgent {
      * @return 最终答案（final 标签内容 / 错误信息 / 步数耗尽提示）
      */
     public String ask(String userMessage) {
-        // 1) 把用户消息压入历史，作为后续 prompt 的"当前请求"
+        // 1) 把用户消息压入历史
         history.add(Map.of("role", "user", "content", userMessage));
 
-        // 2) 两套上限：toolSteps 控"做了多少事"，attempts 控"叫 LLM 多少次"
+        // ================================================================
+        // Phase 1: 路由分类 — 只用一次，后续复用上次结果
+        // 原理：同一轮对话中用户的需求不会频繁切换，不需要每次都路由
+        // ================================================================
+        String route;
+        String routeRaw;
+
+        if (lastRoute != null) {
+            // 复用上次路由结果，跳过 router 调用
+            route = lastRoute;
+            routeRaw = "";
+            if ("direct".equals(route)) {
+                System.out.println(C_DIM + "\n── [Router] (skip: continue direct) ──" + C_RESET);
+            } else {
+                System.out.println(C_DIM + "\n── [Router] (skip: continue " + C_YELLOW + route
+                        + C_RESET + C_DIM + " → " + targetModelName(route) + ") ──" + C_RESET);
+            }
+        } else {
+            // 首次消息：走完整路由
+            currentModelName = routerModelName;
+            System.out.println(C_DIM + "\n── [Router] " + C_YELLOW + routerModelName + C_RESET
+                    + C_DIM + " classifying ──" + C_RESET);
+            routeRaw = routeQuery(userMessage);
+            route = parseRoute(routeRaw);
+
+            System.out.println(C_DIM + "── [Router] " + C_YELLOW + route + C_RESET + C_DIM
+                    + " (→ " + targetModelName(route) + ") ──" + C_RESET);
+        }
+
+        // "direct" → 小模型已给出答案，直接返回，不走大模型
+        if ("direct".equals(route)) {
+            if (routeRaw.isEmpty()) {
+                // 跳过了路由，直接用 8b 回答（不分类，直接答）
+                routeRaw = directAnswer(userMessage);
+            }
+            // 检查 8b 是否主动要求换模型（遇到复杂问题时）
+            Matcher rem = REROUTE_TAG.matcher(routeRaw);
+            if (rem.find()) {
+                String newRoute = rem.group(1).trim().toLowerCase();
+                if (!"direct".equals(newRoute) && isValidRoute(newRoute)) {
+                    System.out.println(C_DIM + "── [Reroute] " + C_YELLOW + "direct → " + newRoute + C_RESET + C_DIM + " ──" + C_RESET);
+                    history.add(Map.of("role", "assistant", "content", "(Switching to " + modelNameForRoute(newRoute) + " for better capability)"));
+                    lastRoute = newRoute;
+                    currentModelName = modelNameForRoute(newRoute);
+                    return agentLoop(userMessage, selectLlm(newRoute));
+                }
+            }
+            Matcher fm = FINAL_TAG.matcher(routeRaw);
+            if (fm.find()) {
+                String answer = fm.group(1).trim();
+                if (!answer.isEmpty()) {
+                    lastRoute = "direct";
+                    history.add(Map.of("role", "assistant", "content", answer));
+                    return answer;
+                }
+            }
+            // 解析失败，降级到完整 Agent 循环
+            System.out.println(C_DIM + "  (router direct answer not found, falling back to agent loop)" + C_RESET);
+        }
+
+        // ================================================================
+        // Phase 2: 完整 Agent 循环 — 根据路由选择模型
+        // ================================================================
+        lastRoute = route;
+        return switch (route) {
+            case "knowledge", "web_search" -> {
+                currentModelName = mediumModelName;
+                yield agentLoop(userMessage, mediumLlm);
+            }
+            case "code" -> {
+                currentModelName = maxModelName;
+                yield agentLoop(userMessage, maxLlm);
+            }
+            default -> {
+                currentModelName = maxModelName;
+                yield agentLoop(userMessage, maxLlm);
+            }
+        };
+    }
+
+    /**
+     * 跳过路由时直接用 8b 回答（简洁版 prompt，不做分类）。
+     */
+    private String directAnswer(String userMessage) {
+        String prompt = """
+You are a friendly AI assistant. Reply to the user's message directly and concisely.
+
+If the question is too complex or needs tools, output:
+<reroute>knowledge</reroute>
+<reroute>web_search</reroute>
+<reroute>code</reroute>
+
+Otherwise:
+<final>Your answer here</final>
+
+User: """
+                + userMessage;
+
+        currentModelName = routerModelName;
+        String raw = routerLlm.complete(prompt, 200);
+        System.out.println(C_CYAN + truncate(raw, 300) + C_RESET);
+        return raw;
+    }
+
+    /** 根据路由名称返回要显示的模型名（仅用于终端提示） */
+    private String targetModelName(String route) {
+        return switch (route) {
+            case "direct" -> "direct answer";
+            case "knowledge", "web_search" -> mediumModelName;
+            case "code" -> maxModelName;
+            default -> maxModelName;
+        };
+    }
+
+    /** 是否是合法的路由值 */
+    private static boolean isValidRoute(String route) {
+        return Set.of("direct", "knowledge", "web_search", "code").contains(route);
+    }
+
+    /** 根据路由选择对应的 LLM 客户端 */
+    private DeepSeekClient selectLlm(String route) {
+        return switch (route) {
+            case "knowledge", "web_search" -> mediumLlm;
+            case "code" -> maxLlm;
+            default -> maxLlm;
+        };
+    }
+
+    /** 根据路由返回模型显示名 */
+    private String modelNameForRoute(String route) {
+        return switch (route) {
+            case "knowledge", "web_search" -> mediumModelName;
+            case "code" -> maxModelName;
+            default -> maxModelName;
+        };
+    }
+
+    /**
+     * 路由分类：用小模型（router）快速判断用户意图。
+     * <p>
+     * 输出格式规范：
+     * <ul>
+     *   <li>{@code <route>direct</route><final>答案</final>} — 简单问题，直接回答</li>
+     *   <li>{@code <route>knowledge</route>} — 需查知识库（Java 面试题等）</li>
+     *   <li>{@code <route>web_search</route>} — 需联网搜索</li>
+     *   <li>{@code <route>code</route>} — 文件操作、编码任务</li>
+     * </ul>
+     */
+    private String routeQuery(String userMessage) {
+        String prompt = """
+You are a query router for java-pico, an AI assistant for Java interview preparation.
+
+Classify the user's question into ONE category and reply EXACTLY as shown:
+
+"direct" — Greetings, chat, simple Q&A, opinions. Answer directly, no tools needed:
+<route>direct</route>
+<final>Your direct answer here</final>
+
+"knowledge" — Java interview questions, JVM, JUC, Spring, MySQL, Redis, MQ, design patterns, technical concepts:
+<route>knowledge</route>
+
+"web_search" — Real-time info, news, weather, jobs, current events:
+<route>web_search</route>
+
+"code" — File operations, code writing/reading/analysis, debugging:
+<route>code</route>
+
+User: """
+                + userMessage;
+
+        String raw = routerLlm.complete(prompt, 300);
+        System.out.println(C_CYAN + truncate(raw, 300) + C_RESET);
+        return raw;
+    }
+
+    /**
+     * 从 router 输出中提取 {@code <route>} 标签的值。
+     * 无法识别时默认返回 "knowledge"（让大模型兜底处理）。
+     */
+    private static String parseRoute(String raw) {
+        if (raw == null || raw.isBlank()) return "knowledge";
+        Matcher m = ROUTE_TAG.matcher(raw);
+        if (m.find()) {
+            String route = m.group(1).trim().toLowerCase();
+            if (Set.of("direct", "knowledge", "web_search", "code").contains(route)) {
+                return route;
+            }
+        }
+        return "knowledge"; // 默认走完整 Agent 循环
+    }
+
+    /**
+     * Agent 主循环（由 {@link #ask} 在路由阶段之后调用）。
+     * <p>
+     * 使用传入的 LLM 客户端执行完整的 ReAct 循环：
+     * 构建 Prompt → 调 LLM → 解析 → 执行工具 → 继续 / 返回
+     *
+     * @param userMessage 原始用户输入
+     * @param llm         本次 Agent 循环使用的 LLM 客户端
+     */
+    private String agentLoop(String userMessage, DeepSeekClient llm) {
         int toolSteps = 0;
         int attempts = 0;
         int maxAttempts = maxSteps + 3;
 
-        // 3) Agent 主循环
         while (toolSteps < maxSteps && attempts < maxAttempts) {
             attempts++;
 
-            // 3.1 拼 prompt（系统提示 + 工具表 + 工作区快照 + 历史 + 当前请求）
+            // 3.1 拼 prompt
             String prompt = buildPrompt(userMessage, history);
 
-            // 3.2 调 LLM，并打日志
-            System.out.println(C_DIM + "\n--- [PicoAgent] LLM call #" + attempts + " ---" + C_RESET);
+            // 3.2 调 LLM，并打日志（含当前模型名）
+            System.out.println(C_DIM + "\n--- [PicoAgent] LLM call #" + attempts
+                    + " (model: " + C_YELLOW + currentModelName + C_RESET + C_DIM + ") ---" + C_RESET);
             long start = System.currentTimeMillis();
             String raw = llm.complete(prompt, maxNewTokens);
             long elapsed = System.currentTimeMillis() - start;
             System.out.println(C_DIM + "--- [PicoAgent] response in " + elapsed + "ms ---" + C_RESET);
-            // 只有非 final 响应才打印原始输出（避免和最终答案重复打印）
             if (!raw.contains("<final>")) {
                 System.out.println(C_CYAN + truncate(raw, 300) + C_RESET);
             }
 
-            // 3.3 解析 LLM 输出，按 4 种 kind 分发
+            // 3.3 检查模型是否主动要求换路由
+            Matcher rem = REROUTE_TAG.matcher(raw);
+            if (rem.find()) {
+                String newRoute = rem.group(1).trim().toLowerCase();
+                if (!newRoute.equals(lastRoute) && isValidRoute(newRoute)) {
+                    System.out.println(C_DIM + "── [Reroute] " + C_YELLOW + lastRoute + " → " + newRoute + C_RESET + C_DIM + " ──" + C_RESET);
+                    history.add(Map.of("role", "assistant", "content",
+                            "(Switching to " + modelNameForRoute(newRoute) + " for better capability)"));
+                    lastRoute = newRoute;
+                    currentModelName = modelNameForRoute(newRoute);
+                    llm = selectLlm(newRoute);
+                    continue;
+                }
+            }
+
+            // 3.4 解析
             ParseResult parsed = parse(raw);
             switch (parsed.kind) {
                 case "error" -> {
-                    // 错误：直接返回，不再继续循环
                     history.add(Map.of("role", "assistant", "content", raw));
                     return "Error: " + parsed.content;
                 }
                 case "retry" -> {
-                    // LLM 没产出合法标签，把"为什么需要重试"写回 history 让它自纠
                     history.add(Map.of("role", "assistant", "content", parsed.content));
-                    // 继续循环
                 }
                 case "tool" -> {
-                    // 工具调用：执行 → 写回 history → 继续循环
                     toolSteps++;
                     String toolResult = executeTool(parsed.name, parsed.args);
 
-                    // 给知识库/网页搜索结果加醒目的可视化分隔，方便用户在终端跟踪
                     if ("search_knowledge".equals(parsed.name)) {
                         System.out.println(C_BLUE + "\n========== Knowledge Base Results ==========" + C_RESET);
                         System.out.println(C_YELLOW + toolResult + C_RESET);
@@ -217,20 +458,17 @@ public class PicoAgent {
                         System.out.println(C_BLUE + "=============================================\n" + C_RESET);
                     }
 
-                    // 工具结果入栈，下一轮 prompt 渲染时会被格式化成"Tool result (xxx): ..."
                     history.add(Map.of("role", "tool", "name", parsed.name,
                                        "args", String.valueOf(parsed.args),
                                        "content", toolResult));
                 }
                 case "final" -> {
-                    // 收到 final：终止循环，返回答案
                     history.add(Map.of("role", "assistant", "content", parsed.content));
                     return parsed.content;
                 }
             }
         }
 
-        // 4) 循环退出：要么 step 用完，要么 LLM 反复乱答
         String msg = toolSteps >= maxSteps
                 ? C_RED + "Stopped after reaching the step limit (" + maxSteps + ")." + C_RESET
                 : C_RED + "Stopped after too many malformed responses." + C_RESET;
@@ -245,6 +483,14 @@ public class PicoAgent {
      */
     public List<Map<String, String>> getHistory() {
         return List.copyOf(history);
+    }
+
+    /**
+     * 返回当前正在对话的模型名称。
+     * 路由阶段返回路由器模型名，推理阶段返回推理模型名。
+     */
+    public String getCurrentModelName() {
+        return currentModelName;
     }
 
     // ===================================================================
@@ -287,9 +533,12 @@ RULES:
 - For general questions (about tools, chat, etc.): answer directly, no search needed.
 - For real-time info (news, jobs): use web_search.
 
-Reply with EXACTLY one of:
+Reply with one of:
 <tool>{"name":"...","args":{...}}</tool>
 <final>Your answer</final>
+<reroute>knowledge</reroute>   — switch to knowledge + web search model
+<reroute>code</reroute>        — switch to code model
+<reroute>direct</reroute>      — switch to lightweight chat model
 
 === KNOWLEDGE BASE (use FIRST for interview questions) ===
 - search_knowledge {"query":"..."} — search Java interview knowledge base

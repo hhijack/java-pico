@@ -91,17 +91,27 @@ public class PicoCLI implements ApplicationRunner {
 
         // 加载配置
         PicoConfig config = new PicoConfig();
-        if (config.deepseekApiKey.isBlank()) {
-            System.err.println("Error: DEEPSEEK_API_KEY is not set.");
+        if (config.apiKey.isBlank()) {
+            System.err.println("Error: API_KEY is not set.");
             System.err.println("Set it via environment variable or create .pico/config.json");
             return;
         }
 
-        // 初始化 LLM 客户端
-        DeepSeekClient llm = new DeepSeekClient(
-                config.deepseekApiKey,
-                config.deepseekBaseUrl,
-                config.deepseekModel
+        // 初始化三个 LLM 客户端（路由 + 中等 + 最强）
+        DeepSeekClient routerLlm = new DeepSeekClient(
+                config.apiKey,
+                config.baseUrl,
+                config.routerModel
+        );
+        DeepSeekClient mediumLlm = new DeepSeekClient(
+                config.apiKey,
+                config.baseUrl,
+                config.mediumModel
+        );
+        DeepSeekClient maxLlm = new DeepSeekClient(
+                config.apiKey,
+                config.baseUrl,
+                config.maxModel
         );
 
         // 初始化 RAG 检索
@@ -110,21 +120,30 @@ public class PicoCLI implements ApplicationRunner {
         // 初始化 Agent
         Path workspace = Path.of(config.workspacePath).toAbsolutePath().normalize();
         System.out.println(C_DIM + "Workspace: " + C_YELLOW + workspace + C_RESET);
-        System.out.println(C_DIM + "Model: " + C_YELLOW + config.deepseekModel + C_RESET);
+        System.out.println(C_DIM + "Router:  " + C_YELLOW + config.routerModel + C_RESET);
+        System.out.println(C_DIM + "Medium:  " + C_YELLOW + config.mediumModel + C_RESET);
+        System.out.println(C_DIM + "Max:     " + C_YELLOW + config.maxModel + C_RESET);
         System.out.println(C_DIM + "Max steps: " + C_YELLOW + config.maxSteps + C_RESET);
         System.out.println();
 
         // 修复控制台编码，确保中文 I/O 正常工作（Windows + Git Bash 场景）
         fixConsoleEncoding();
 
-        PicoAgent agent = new PicoAgent(llm, codeTool, webSearchTool, rag, workspace,
+        PicoAgent agent = new PicoAgent(routerLlm, mediumLlm, maxLlm,
+                config.routerModel, config.mediumModel, config.maxModel,
+                codeTool, webSearchTool, rag, workspace,
                 config.maxSteps, config.maxNewTokens);
 
         // REPL 循环（使用 UTF-8 读取输入以支持中文）
         @SuppressWarnings("resource")
         Scanner scanner = new Scanner(System.in, StandardCharsets.UTF_8);
         while (true) {
-            System.out.print(C_BOLD + C_GREEN + "java-pico> " + C_RESET);
+            // 显示上次对话使用的模型名（首次显示默认推理模型）
+            String modelTag = agent.getCurrentModelName();
+            String modelDisplay = modelTag != null ? " [" + modelTag + "]" : "";
+            System.out.print(C_BOLD + C_GREEN + "java-pico" + C_RESET
+                    + C_DIM + modelDisplay + C_RESET
+                    + C_BOLD + C_GREEN + "> " + C_RESET);
             String input;
             try {
                 input = scanner.nextLine().trim();
@@ -150,7 +169,8 @@ public class PicoCLI implements ApplicationRunner {
             System.out.println();
             System.out.println(C_BRIGHT_GREEN + answer + C_RESET);
             System.out.println();
-            System.out.println(C_DIM + "--- (" + elapsed + "ms) ---" + C_RESET);
+            System.out.println(C_DIM + "--- (" + elapsed + "ms) ["
+                    + C_YELLOW + agent.getCurrentModelName() + C_RESET + C_DIM + "] ---" + C_RESET);
             System.out.println();
         }
     }
