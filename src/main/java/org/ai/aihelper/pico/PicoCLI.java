@@ -11,6 +11,7 @@ import org.springframework.stereotype.Component;
 import java.io.PrintStream;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Scanner;
 
@@ -134,6 +135,18 @@ public class PicoCLI implements ApplicationRunner {
                 codeTool, webSearchTool, rag, workspace,
                 config.maxSteps, config.maxNewTokens);
 
+        // 加载持久化记忆
+        Path memoryFile = Path.of(".pico", "memory.json");
+        if (Files.isRegularFile(memoryFile)) {
+            try {
+                String json = Files.readString(memoryFile, StandardCharsets.UTF_8);
+                agent.getMemory().loadFrom(json);
+                System.out.println(C_DIM + "Memory loaded: " + C_YELLOW + memoryFile + C_RESET);
+            } catch (Exception e) {
+                System.out.println(C_DIM + "Memory load failed: " + e.getMessage() + C_RESET);
+            }
+        }
+
         // REPL 循环（使用 UTF-8 读取输入以支持中文）
         @SuppressWarnings("resource")
         Scanner scanner = new Scanner(System.in, StandardCharsets.UTF_8);
@@ -148,12 +161,14 @@ public class PicoCLI implements ApplicationRunner {
             try {
                 input = scanner.nextLine().trim();
             } catch (Exception e) {
+                saveMemory(agent, memoryFile);
                 System.out.println();
                 break;
             }
 
             if (input.isBlank()) continue;
             if (input.equals("/exit") || input.equals("/quit")) {
+                saveMemory(agent, memoryFile);
                 System.out.println(C_YELLOW + "bye!" + C_RESET);
                 break;
             }
@@ -172,6 +187,22 @@ public class PicoCLI implements ApplicationRunner {
             System.out.println(C_DIM + "--- (" + elapsed + "ms) ["
                     + C_YELLOW + agent.getCurrentModelName() + C_RESET + C_DIM + "] ---" + C_RESET);
             System.out.println();
+        }
+    }
+
+    /**
+     * 保存会话记忆到文件。
+     */
+    private static void saveMemory(PicoAgent agent, Path memoryFile) {
+        try {
+            String json = agent.getMemory().serialize();
+            if (json != null && !json.equals("{}")) {
+                Files.createDirectories(memoryFile.getParent());
+                Files.writeString(memoryFile, json, StandardCharsets.UTF_8);
+                System.out.println(C_DIM + "Memory saved: " + C_YELLOW + memoryFile + C_RESET);
+            }
+        } catch (Exception e) {
+            System.err.println("Warning: failed to save memory: " + e.getMessage());
         }
     }
 

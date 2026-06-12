@@ -107,6 +107,7 @@ public class PicoAgent {
     private String currentModelName;
     /** 上一次路由结果：连续 direct 时可跳过路由，直接回答 */
     private String lastRoute = null;
+    /** 结构化多层会话记忆 */    private SessionMemory memory;
     /** 本地文件操作工具集：list_files / read_file / write_file / patch_file / search */
     private final CodeTool codeTool;
     /** 网页搜索工具：处理"实时新闻/最新资讯"类请求 */
@@ -166,6 +167,7 @@ public class PicoAgent {
         this.maxSteps = maxSteps;
         this.maxNewTokens = maxNewTokens;
         this.currentModelName = maxModelName;
+        this.memory = new SessionMemory();
     }
 
     // ===================================================================
@@ -196,6 +198,9 @@ public class PicoAgent {
     public String ask(String userMessage) {
         // 1) 把用户消息压入历史
         history.add(Map.of("role", "user", "content", userMessage));
+
+        // 2) 更新记忆：当前任务摘要
+        memory.setTaskSummary(userMessage);
 
         // ================================================================
         // Phase 1: 路由分类 — 只用一次，后续复用上次结果
@@ -493,6 +498,10 @@ User: """
         return currentModelName;
     }
 
+    public SessionMemory getMemory() {
+        return memory;
+    }
+
     // ===================================================================
     //                      Prompt 构建（系统提示 + 上下文）
     // ===================================================================
@@ -556,7 +565,9 @@ Reply with one of:
 Workspace: """
                 + workspace
                 + "\nFiles:\n" + snapshot
-                + "\nHistory:\n" + h
+                + "\n" + memory.renderMemoryText(workspaceRoot)
+                + memory.renderRelevantMemory(userMessage)
+                + "History:\n" + h
                 + "\nUser: " + userMessage + "\n";
     }
 
@@ -728,7 +739,7 @@ Workspace: """
     @SuppressWarnings("unchecked")
     private String executeTool(String name, Map<String, Object> args) {
         try {
-            return switch (name) {
+            String result = switch (name) {
                 case "list_files" -> codeTool.listFiles(asStr(args.get("path"), "."));
                 case "read_file" -> codeTool.readFile(
                         asStr(args.get("path"), ""),
@@ -748,6 +759,26 @@ Workspace: """
                 case "web_search" -> webSearchTool.search(asStr(args.get("query"), ""));
                 default -> "error: unknown tool '" + name + "'";
             };
+
+            // === 记忆层：工具执行结果沉淀到记忆 ===
+            String filePath = asStr(args.get("path"), "");
+            if (!filePath.isBlank() && !filePath.equals(".")) {
+                // 解析为相对于工作区的规范路径
+                String canonicalPath = workspaceRoot.resolve(filePath).normalize().toString();
+                String relativePath = Path.of(".").relativize(Path.of(canonicalPath)).toString();
+
+                if ("read_file".equals(name) && result != null && !result.startsWith("error:")) {
+                    memory.rememberFile(relativePath);
+                    String summary = SessionMemory.summarizeContent(result);
+                    memory.setFileSummary(canonicalPath, summary);
+                    memory.appendNote(summary, Set.of(relativePath), relativePath);
+                } else if ("write_file".equals(name) || "patch_file".equals(name)) {
+                    memory.rememberFile(relativePath);
+                    memory.invalidateFileSummary(canonicalPath);
+                }
+            }
+
+            return result;
         } catch (Exception e) {
             return "error: tool " + name + " failed: " + e.getMessage();
         }
