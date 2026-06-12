@@ -108,6 +108,7 @@ public class PicoAgent {
     /** 上一次路由结果：连续 direct 时可跳过路由，直接回答 */
     private String lastRoute = null;
     /** 结构化多层会话记忆 */    private SessionMemory memory;
+    /** 单次调用的运行记录器（trace + report） */    private RunStore runStore;
     /** 本地文件操作工具集：list_files / read_file / write_file / patch_file / search */
     private final CodeTool codeTool;
     /** 网页搜索工具：处理"实时新闻/最新资讯"类请求 */
@@ -168,6 +169,7 @@ public class PicoAgent {
         this.maxNewTokens = maxNewTokens;
         this.currentModelName = maxModelName;
         this.memory = new SessionMemory();
+        this.runStore = new RunStore(workspaceRoot.resolve(".pico"));
     }
 
     // ===================================================================
@@ -202,6 +204,9 @@ public class PicoAgent {
         // 2) 更新记忆：当前任务摘要
         memory.setTaskSummary(userMessage);
 
+        // 3) 启动运行记录
+        runStore.startRun(userMessage);
+
         // ================================================================
         // Phase 1: 路由分类 — 只用一次，后续复用上次结果
         // 原理：同一轮对话中用户的需求不会频繁切换，不需要每次都路由
@@ -231,42 +236,15 @@ public class PicoAgent {
                     + " (→ " + targetModelName(route) + ") ──" + C_RESET);
         }
 
-        // "direct" → 小模型已给出答案，直接返回，不走大模型
-        if ("direct".equals(route)) {
-            if (routeRaw.isEmpty()) {
-                // 跳过了路由，直接用 8b 回答（不分类，直接答）
-                routeRaw = directAnswer(userMessage);
-            }
-            // 检查 8b 是否主动要求换模型（遇到复杂问题时）
-            Matcher rem = REROUTE_TAG.matcher(routeRaw);
-            if (rem.find()) {
-                String newRoute = rem.group(1).trim().toLowerCase();
-                if (!"direct".equals(newRoute) && isValidRoute(newRoute)) {
-                    System.out.println(C_DIM + "── [Reroute] " + C_YELLOW + "direct → " + newRoute + C_RESET + C_DIM + " ──" + C_RESET);
-                    history.add(Map.of("role", "assistant", "content", "(Switching to " + modelNameForRoute(newRoute) + " for better capability)"));
-                    lastRoute = newRoute;
-                    currentModelName = modelNameForRoute(newRoute);
-                    return agentLoop(userMessage, selectLlm(newRoute));
-                }
-            }
-            Matcher fm = FINAL_TAG.matcher(routeRaw);
-            if (fm.find()) {
-                String answer = fm.group(1).trim();
-                if (!answer.isEmpty()) {
-                    lastRoute = "direct";
-                    history.add(Map.of("role", "assistant", "content", answer));
-                    return answer;
-                }
-            }
-            // 解析失败，降级到完整 Agent 循环
-            System.out.println(C_DIM + "  (router direct answer not found, falling back to agent loop)" + C_RESET);
-        }
-
         // ================================================================
-        // Phase 2: 完整 Agent 循环 — 根据路由选择模型
+        // Phase 2: 完整 Agent 循环 — 统一用一种 prompt，按路由选模型
         // ================================================================
         lastRoute = route;
         return switch (route) {
+            case "direct" -> {
+                currentModelName = routerModelName;
+                yield agentLoop(userMessage, routerLlm);
+            }
             case "knowledge", "web_search" -> {
                 currentModelName = mediumModelName;
                 yield agentLoop(userMessage, mediumLlm);
@@ -282,29 +260,6 @@ public class PicoAgent {
         };
     }
 
-    /**
-     * 跳过路由时直接用 8b 回答（简洁版 prompt，不做分类）。
-     */
-    private String directAnswer(String userMessage) {
-        String prompt = """
-You are a friendly AI assistant. Reply to the user's message directly and concisely.
-
-If the question is too complex or needs tools, output:
-<reroute>knowledge</reroute>
-<reroute>web_search</reroute>
-<reroute>code</reroute>
-
-Otherwise:
-<final>Your answer here</final>
-
-User: """
-                + userMessage;
-
-        currentModelName = routerModelName;
-        String raw = routerLlm.complete(prompt, 200);
-        System.out.println(C_CYAN + truncate(raw, 300) + C_RESET);
-        return raw;
-    }
 
     /** 根据路由名称返回要显示的模型名（仅用于终端提示） */
     private String targetModelName(String route) {
@@ -324,6 +279,7 @@ User: """
     /** 根据路由选择对应的 LLM 客户端 */
     private DeepSeekClient selectLlm(String route) {
         return switch (route) {
+            case "direct" -> routerLlm;
             case "knowledge", "web_search" -> mediumLlm;
             case "code" -> maxLlm;
             default -> maxLlm;
@@ -333,6 +289,7 @@ User: """
     /** 根据路由返回模型显示名 */
     private String modelNameForRoute(String route) {
         return switch (route) {
+            case "direct" -> routerModelName;
             case "knowledge", "web_search" -> mediumModelName;
             case "code" -> maxModelName;
             default -> maxModelName;
@@ -402,6 +359,19 @@ User: """
      * @param userMessage 原始用户输入
      * @param llm         本次 Agent 循环使用的 LLM 客户端
      */
+    /** 结束当前 run，写入 report 和 run_finished 事件 */
+    private void finishRun(String status, String stopReason, String finalAnswer, int toolSteps, int attempts) {
+        runStore.writeReport(status, stopReason != null ? stopReason : "", finalAnswer,
+                toolSteps, attempts, currentModelName);
+        java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("status", status);
+        payload.put("stop_reason", stopReason != null ? stopReason : "");
+        payload.put("tool_steps", String.valueOf(toolSteps));
+        payload.put("attempts", String.valueOf(attempts));
+        runStore.emit("run_finished", payload);
+    }
+
+    
     private String agentLoop(String userMessage, DeepSeekClient llm) {
         int toolSteps = 0;
         int attempts = 0;
@@ -416,6 +386,7 @@ User: """
             // 3.2 调 LLM，并打日志（含当前模型名）
             System.out.println(C_DIM + "\n--- [PicoAgent] LLM call #" + attempts
                     + " (model: " + C_YELLOW + currentModelName + C_RESET + C_DIM + ") ---" + C_RESET);
+            runStore.emit("model_requested", java.util.Map.of("attempts", String.valueOf(attempts)));
             long start = System.currentTimeMillis();
             String raw = llm.complete(prompt, maxNewTokens);
             long elapsed = System.currentTimeMillis() - start;
@@ -430,9 +401,10 @@ User: """
                 String newRoute = rem.group(1).trim().toLowerCase();
                 if (!newRoute.equals(lastRoute) && isValidRoute(newRoute)) {
                     System.out.println(C_DIM + "── [Reroute] " + C_YELLOW + lastRoute + " → " + newRoute + C_RESET + C_DIM + " ──" + C_RESET);
+                    lastRoute = newRoute;
+
                     history.add(Map.of("role", "assistant", "content",
                             "(Switching to " + modelNameForRoute(newRoute) + " for better capability)"));
-                    lastRoute = newRoute;
                     currentModelName = modelNameForRoute(newRoute);
                     llm = selectLlm(newRoute);
                     continue;
@@ -443,6 +415,7 @@ User: """
             ParseResult parsed = parse(raw);
             switch (parsed.kind) {
                 case "error" -> {
+                    finishRun("error", parsed.content, null, toolSteps, attempts);
                     history.add(Map.of("role", "assistant", "content", raw));
                     return "Error: " + parsed.content;
                 }
@@ -452,6 +425,7 @@ User: """
                 case "tool" -> {
                     toolSteps++;
                     String toolResult = executeTool(parsed.name, parsed.args);
+                    runStore.emit("tool_executed", java.util.Map.of("name", parsed.name, "args", String.valueOf(parsed.args)));
 
                     if ("search_knowledge".equals(parsed.name)) {
                         System.out.println(C_BLUE + "\n========== Knowledge Base Results ==========" + C_RESET);
@@ -469,6 +443,7 @@ User: """
                 }
                 case "final" -> {
                     history.add(Map.of("role", "assistant", "content", parsed.content));
+                    finishRun("completed", "final_answer", parsed.content, toolSteps, attempts);
                     return parsed.content;
                 }
             }
@@ -477,6 +452,7 @@ User: """
         String msg = toolSteps >= maxSteps
                 ? C_RED + "Stopped after reaching the step limit (" + maxSteps + ")." + C_RESET
                 : C_RED + "Stopped after too many malformed responses." + C_RESET;
+                    finishRun("stopped", msg, null, toolSteps, attempts);
         history.add(Map.of("role", "assistant", "content", msg));
         return msg;
     }
@@ -490,6 +466,12 @@ User: """
         return List.copyOf(history);
     }
 
+    /** 从 session 恢复历史记录（只在启动时调用） */
+    public void restoreHistory(List<Map<String, String>> loadedHistory) {
+        history.clear();
+        history.addAll(loadedHistory);
+    }
+
     /**
      * 返回当前正在对话的模型名称。
      * 路由阶段返回路由器模型名，推理阶段返回推理模型名。
@@ -500,6 +482,10 @@ User: """
 
     public SessionMemory getMemory() {
         return memory;
+    }
+
+    public RunStore getRunStore() {
+        return runStore;
     }
 
     // ===================================================================
@@ -763,15 +749,22 @@ Workspace: """
             // === 记忆层：工具执行结果沉淀到记忆 ===
             String filePath = asStr(args.get("path"), "");
             if (!filePath.isBlank() && !filePath.equals(".")) {
-                // 解析为相对于工作区的规范路径
                 String canonicalPath = workspaceRoot.resolve(filePath).normalize().toString();
-                String relativePath = Path.of(".").relativize(Path.of(canonicalPath)).toString();
+                String relativePath = filePath; // fallback
+                try {
+                    relativePath = workspaceRoot.relativize(
+                            Path.of(canonicalPath)).toString().replace('\\', '/');
+                } catch (Exception ignored) {
+                    // 跨文件系统时用原始路径
+                }
 
                 if ("read_file".equals(name) && result != null && !result.startsWith("error:")) {
                     memory.rememberFile(relativePath);
                     String summary = SessionMemory.summarizeContent(result);
                     memory.setFileSummary(canonicalPath, summary);
                     memory.appendNote(summary, Set.of(relativePath), relativePath);
+                    // 历史里只留摘要，全文存记忆里；模型可以通过 prompt 中的 file_summaries 看到
+                    return summary;
                 } else if ("write_file".equals(name) || "patch_file".equals(name)) {
                     memory.rememberFile(relativePath);
                     memory.invalidateFileSummary(canonicalPath);
