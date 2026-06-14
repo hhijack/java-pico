@@ -548,6 +548,9 @@ Reply with one of:
 - patch_file {"path":"...","old_text":"...","new_text":"..."} — edit text
 - search {"pattern":"...","path":"."} — search text
 
+=== Shell (requires user approval) ===
+- run_shell {"command":"...","timeout":30} — run shell command in workspace (requires your approval)
+
 Workspace: """
                 + workspace
                 + "\nFiles:\n" + snapshot
@@ -743,6 +746,9 @@ Workspace: """
                         asStr(args.get("path"), "."));
                 case "search_knowledge" -> ragRetriever.search(asStr(args.get("query"), ""));
                 case "web_search" -> webSearchTool.search(asStr(args.get("query"), ""));
+                case "run_shell" -> runShell(
+                        asStr(args.get("command"), ""),
+                        asInt(args.get("timeout"), 30));
                 default -> "error: unknown tool '" + name + "'";
             };
 
@@ -774,6 +780,58 @@ Workspace: """
             return result;
         } catch (Exception e) {
             return "error: tool " + name + " failed: " + e.getMessage();
+        }
+    }
+
+    /** 执行 shell 命令（需用户审批，超时保护） */
+    private String runShell(String command, int timeout) {
+        if (command == null || command.isBlank()) return "error: command is empty";
+
+        // 1. 用户审批
+        System.out.println(C_YELLOW + "\n╔══════════════════════════════════════════╗");
+        System.out.println("║ Shell execution requires your approval   ║");
+        System.out.println("╚══════════════════════════════════════════╝" + C_RESET);
+        System.out.println(C_DIM + "Workspace: " + C_YELLOW + workspaceRoot + C_RESET);
+        System.out.println(C_DIM + "Command:   " + C_YELLOW + command + C_RESET);
+        System.out.print(C_BOLD + "Allow? (y/N): " + C_RESET);
+        String input;
+        try {
+            input = new java.util.Scanner(System.in).nextLine().trim();
+        } catch (Exception e) {
+            return "error: failed to read user input";
+        }
+        if (!input.equalsIgnoreCase("y")) {
+            System.out.println(C_DIM + "→ Shell rejected by user" + C_RESET);
+            return "user rejected: shell execution denied";
+        }
+        System.out.println(C_DIM + "→ Shell approved, executing..." + C_RESET);
+
+        // 2. 执行
+        long start = System.currentTimeMillis();
+        try {
+            ProcessBuilder pb = new ProcessBuilder()
+                    .command("bash", "-c", command)
+                    .directory(workspaceRoot.toFile())
+                    .redirectErrorStream(true);
+            // 不继承父进程环境变量
+            pb.environment().clear();
+            pb.environment().put("PATH", "/usr/bin:/bin:/usr/local/bin");
+
+            Process process = pb.start();
+            boolean finished = process.waitFor(Math.min(timeout, 120), java.util.concurrent.TimeUnit.SECONDS);
+            long elapsed = System.currentTimeMillis() - start;
+
+            if (!finished) {
+                process.destroyForcibly();
+                return "error: command timed out after " + timeout + "s";
+            }
+
+            String output = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            int exitCode = process.exitValue();
+            String result = "exit code: " + exitCode + " (" + elapsed + "ms)\n" + output.trim();
+            return result;
+        } catch (Exception e) {
+            return "error: shell execution failed - " + e.getMessage();
         }
     }
 
