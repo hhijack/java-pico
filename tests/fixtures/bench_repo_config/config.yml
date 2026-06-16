@@ -1,0 +1,18 @@
+# Application Configuration
+server:
+  port: 8080
+  host: localhost
+
+database:
+  url: jdbc:postgresql://localhost:5432/app_db
+  username: admin
+  password: change_me
+
+logging:
+  level: INFO
+  format: json
+
+features:
+  enable_rag: true
+  enable_web_search: false
+  max_results: 10

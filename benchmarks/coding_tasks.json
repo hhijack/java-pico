@@ -1,0 +1,72 @@
+[
+  {
+    "id": "readme_intro_locked",
+    "prompt": "In the README fixture, replace the placeholder opening sentence with 'This project is a Java Agent framework built from scratch.'",
+    "fixture_repo": "tests/fixtures/bench_repo_readme",
+    "allowed_tools": ["read_file", "write_file", "patch_file", "search"],
+    "step_budget": 3,
+    "expected_artifact": "README.md contains the new opening sentence",
+    "verifier": "python3 -c \"import sys; content=open('README.md').read(); assert '<placeholder>' not in content, 'placeholder still exists'; assert 'Java Agent framework' in content, 'new text not found'; print('PASS')\"",
+    "category": "documentation"
+  },
+  {
+    "id": "config_value_modify",
+    "prompt": "In the config fixture, change the database password from 'change_me' to 'secret_password_2026' using patch_file.",
+    "fixture_repo": "tests/fixtures/bench_repo_config",
+    "allowed_tools": ["read_file", "patch_file", "search"],
+    "step_budget": 2,
+    "expected_artifact": "config.yml password is updated",
+    "verifier": "python3 -c \"import sys; content=open('config.yml').read(); assert 'change_me' not in content, 'old password exists'; assert 'secret_password_2026' in content, 'new password not found'; print('PASS')\"",
+    "category": "configuration"
+  },
+  {
+    "id": "code_read_and_summarize",
+    "prompt": "In the code fixture, read the UserService.java file and tell me what methods are available in the UserService class.",
+    "fixture_repo": "tests/fixtures/bench_repo_code",
+    "allowed_tools": ["read_file", "search"],
+    "step_budget": 2,
+    "expected_artifact": "agent returns a list of methods in UserService",
+    "verifier": "python3 -c \"import sys; content=open('UserService.java').read(); assert 'findById' in content; assert 'findAll' in content; assert 'save' in content; assert 'exists' in content; print('PASS')\"",
+    "category": "code_understanding"
+  },
+  {
+    "id": "config_enable_web_search",
+    "prompt": "In the config fixture, change enable_web_search from false to true, and set max_results to 20.",
+    "fixture_repo": "tests/fixtures/bench_repo_config",
+    "allowed_tools": ["read_file", "patch_file", "search"],
+    "step_budget": 3,
+    "expected_artifact": "config.yml has web_search enabled and max_results=20",
+    "verifier": "python3 -c \"import sys; content=open('config.yml').read(); assert 'enable_web_search: true' in content, 'web search not enabled'; assert 'max_results: 20' in content; print('PASS')\"",
+    "category": "configuration"
+  },
+  {
+    "id": "code_add_method",
+    "prompt": "In the code fixture, add a 'deleteById' method to UserService that removes a user by id and returns true if removed, false if not found.",
+    "fixture_repo": "tests/fixtures/bench_repo_code",
+    "allowed_tools": ["read_file", "patch_file", "search"],
+    "step_budget": 4,
+    "expected_artifact": "UserService.java contains deleteById method",
+    "verifier": "python3 -c \"import sys; content=open('UserService.java').read(); assert 'deleteById' in content, 'method not found'; assert 'userStore.remove' in content or 'userStore.containsKey' in content or 'remove' in content, 'remove logic not found'; print('PASS')\"",
+    "category": "code_modification"
+  },
+  {
+    "id": "search_in_code",
+    "prompt": "In the code fixture, search for all places where 'HashMap' is used, and report which files and lines reference it.",
+    "fixture_repo": "tests/fixtures/bench_repo_code",
+    "allowed_tools": ["search", "read_file"],
+    "step_budget": 2,
+    "expected_artifact": "agent identifies HashMap usage in UserService.java",
+    "verifier": "python3 -c \"import sys; content=open('UserService.java').read(); assert 'HashMap' in content; print('PASS')\"",
+    "category": "code_understanding"
+  },
+  {
+    "id": "readme_append_section",
+    "prompt": "In the README fixture, append a new section at the end called '## Usage' with the content 'Run the agent with: java -jar agent.jar'.",
+    "fixture_repo": "tests/fixtures/bench_repo_readme",
+    "allowed_tools": ["read_file", "patch_file", "write_file"],
+    "step_budget": 3,
+    "expected_artifact": "README.md has a new Usage section",
+    "verifier": "python3 -c \"import sys; content=open('README.md').read(); assert '## Usage' in content, 'Usage section missing'; assert 'java -jar agent.jar' in content, 'command not found'; print('PASS')\"",
+    "category": "documentation"
+  }
+]
