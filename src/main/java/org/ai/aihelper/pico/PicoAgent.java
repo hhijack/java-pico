@@ -424,6 +424,17 @@ User: """
                 }
                 case "tool" -> {
                     toolSteps++;
+
+                    // 提取 <tool> 标签前的自然语言思考，合并进工具结果
+                    String thinkingPrefix = "";
+                    int toolTagIdx = raw.indexOf("<tool>");
+                    if (toolTagIdx > 0) {
+                        String thinking = raw.substring(0, toolTagIdx).trim();
+                        if (!thinking.isEmpty()) {
+                            thinkingPrefix = thinking + "\n---\n";
+                        }
+                    }
+
                     String toolResult = executeTool(parsed.name, parsed.args);
                     runStore.emit("tool_executed", java.util.Map.of("name", parsed.name, "args", String.valueOf(parsed.args)));
 
@@ -439,7 +450,7 @@ User: """
 
                     history.add(Map.of("role", "tool", "name", parsed.name,
                                        "args", String.valueOf(parsed.args),
-                                       "content", toolResult));
+                                       "content", thinkingPrefix + toolResult));
                 }
                 case "final" -> {
                     history.add(Map.of("role", "assistant", "content", parsed.content));
@@ -600,7 +611,16 @@ Workspace: """
                 } else if ("web_search".equals(name)) {
                     sb.append("Web search results:\n").append(content).append("\n");
                 } else {
-                    sb.append("Tool result (").append(name).append("): ").append(truncate(content, 300)).append("\n");
+                    // 有思考前缀（"思考\n---\n结果"）时只截断后半段
+                    int sepIdx = content.indexOf("\n---\n");
+                    if (sepIdx > 0) {
+                        String thinking = content.substring(0, sepIdx + 5); // 包括 "---\n"
+                        String rest = content.substring(sepIdx + 5);
+                        sb.append("Tool result (").append(name).append("): ").append(thinking)
+                          .append(truncate(rest, 300)).append("\n");
+                    } else {
+                        sb.append("Tool result (").append(name).append("): ").append(truncate(content, 300)).append("\n");
+                    }
                 }
             } else {
                 sb.append(role).append(": ").append(truncate(item.getOrDefault("content", ""), 200)).append("\n");
