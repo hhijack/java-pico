@@ -63,7 +63,7 @@ public class RunStore {
         try {
             ObjectNode root = json.createObjectNode();
             root.put("event", event);
-            root.put("created_at", Instant.now().toString());
+            root.put("created_at", java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Shanghai")).toString());
             if (payload != null) {
                 for (Map.Entry<String, Object> e : payload.entrySet()) {
                     Object v = e.getValue();

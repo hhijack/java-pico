@@ -97,7 +97,7 @@ public class DeepSeekClient {
             String apiUrl = baseUrl + "/v1/chat/completions";
 
             // 调试：打印实际发送的 prompt（截断）
-            String debug = prompt.length() > 60 ? prompt.substring(0, 60) + "..." : prompt;
+            String debug = prompt.length() > 500 ? prompt.substring(0, 500) + "..." : prompt;
             System.out.println("--- [DeepSeek] POST " + apiUrl + " (" + jsonBytes.length + " bytes) ---");
             System.out.println("--- [DeepSeek] prompt preview: " + debug + " ---");
 

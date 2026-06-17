@@ -1,0 +1,65 @@
+[
+  {
+    "id": "readme_intro_locked",
+    "status": "passed",
+    "category": "documentation",
+    "stdout": "PASS",
+    "stderr": "",
+    "prompt": "In the README fixture, replace the placeholder opening sentence with 'This project is a Java Agent framework built from scratch.'",
+    "agent_output_size": 4
+  },
+  {
+    "id": "config_value_modify",
+    "status": "passed",
+    "category": "configuration",
+    "stdout": "PASS",
+    "stderr": "",
+    "prompt": "In the config fixture, change the database password from 'change_me' to 'secret_password_2026' using patch_file.",
+    "agent_output_size": 4
+  },
+  {
+    "id": "code_read_and_summarize",
+    "status": "passed",
+    "category": "code_understanding",
+    "stdout": "PASS",
+    "stderr": "",
+    "prompt": "In the code fixture, read the UserService.java file and tell me what methods are available in the UserService class.",
+    "agent_output_size": 4
+  },
+  {
+    "id": "config_enable_web_search",
+    "status": "passed",
+    "category": "configuration",
+    "stdout": "PASS",
+    "stderr": "",
+    "prompt": "In the config fixture, change enable_web_search from false to true, and set max_results to 20.",
+    "agent_output_size": 4
+  },
+  {
+    "id": "code_add_method",
+    "status": "failed",
+    "category": "code_modification",
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nAssertionError: method not found",
+    "prompt": "In the code fixture, add a 'deleteById' method to UserService that removes a user by id and returns true if removed, false if not found.",
+    "agent_output_size": 0
+  },
+  {
+    "id": "search_in_code",
+    "status": "passed",
+    "category": "code_understanding",
+    "stdout": "PASS",
+    "stderr": "",
+    "prompt": "In the code fixture, search for all places where 'HashMap' is used, and report which files and lines reference it.",
+    "agent_output_size": 4
+  },
+  {
+    "id": "readme_append_section",
+    "status": "passed",
+    "category": "documentation",
+    "stdout": "PASS",
+    "stderr": "",
+    "prompt": "In the README fixture, append a new section at the end called '## Usage' with the content 'Run the agent with: java -jar agent.jar'.",
+    "agent_output_size": 4
+  }
+]

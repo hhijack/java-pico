@@ -120,8 +120,14 @@ public class PicoCLI implements ApplicationRunner {
         // 初始化 RAG 检索
         RagRetriever rag = new RagRetriever(contentRetriever);
 
-        // 初始化 Agent
+        // 初始化 Agent（benchmark 模式下可覆盖工作区）
         Path workspace = Path.of(config.workspacePath).toAbsolutePath().normalize();
+        String[] rawArgs = args.getSourceArgs();
+        for (int i = 0; i < rawArgs.length - 1; i++) {
+            if ("--benchmark-workspace".equals(rawArgs[i])) {
+                workspace = Path.of(rawArgs[i + 1]).toAbsolutePath().normalize();
+            }
+        }
         System.out.println(C_DIM + "Workspace: " + C_YELLOW + workspace + C_RESET);
         System.out.println(C_DIM + "Router:  " + C_YELLOW + config.routerModel + C_RESET);
         System.out.println(C_DIM + "Medium:  " + C_YELLOW + config.mediumModel + C_RESET);
@@ -149,6 +155,19 @@ public class PicoCLI implements ApplicationRunner {
             sessionStore.loadMemory(agent.getMemory());
         } catch (Exception e) {
             System.out.println(C_DIM + "Session load failed: " + e.getMessage() + C_RESET);
+        }
+
+        // Benchmark 模式：直接执行 prompt 后退出
+        for (int i = 0; i < rawArgs.length - 1; i++) {
+            if ("--benchmark".equals(rawArgs[i])) {
+                String benchmarkPrompt = rawArgs[i + 1];
+                System.out.println(C_DIM + "Benchmark mode: " + benchmarkPrompt + C_RESET);
+                String answer = agent.ask(benchmarkPrompt);
+                System.out.println();
+                System.out.println(C_BRIGHT_GREEN + answer + C_RESET);
+                System.out.println();
+                return;
+            }
         }
 
         // REPL 循环（使用 UTF-8 读取输入以支持中文）

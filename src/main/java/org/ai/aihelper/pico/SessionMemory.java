@@ -33,7 +33,6 @@ public class SessionMemory {
 
     private static final int WORKING_FILE_LIMIT = 5;
     private static final int NOTE_LIMIT = 50;
-    private static final int SUMMARY_CHARS = 300;
 
     // ===================================================================
     //  Layer 1 & 2: Working Memory
@@ -182,6 +181,7 @@ public class SessionMemory {
 
         for (NoteEntry note : episodicNotes) {
             Set<String> noteTokens = tokenize(note.content);
+            noteTokens.addAll(tokenize(note.source));
             Set<String> noteTags = note.tags.stream()
                     .map(t -> t.toLowerCase(Locale.ROOT))
                     .collect(Collectors.toSet());
@@ -389,24 +389,39 @@ public class SessionMemory {
     // ===================================================================
 
     /**
-     * 把读取到的文件内容压成短摘要（用于 file_summaries 存储）。
-     * 非 LLM 方案：提取首行 + 统计信息 + 尾行。
+     * 把读取到的文件内容压成摘要（用于 file_summaries 存储和历史引用）。
+     * <p>
+     * 策略：
+     * <ul>
+     *   <li>≤ 1000 字符：返回全文（小文件不需要压）</li>
+     *   <li>＞ 1000 字符：保留开头 30 行 + "省略" + 末尾 5 行</li>
+     * </ul>
+     * 这样模型能看清文件的结构（import、类声明、方法签名）和结尾，中间省略。
      */
     public static String summarizeContent(String content) {
         if (content == null || content.isBlank()) return "(empty)";
         String trimmed = content.trim();
-        if (trimmed.length() <= SUMMARY_CHARS) return trimmed;
+        if (trimmed.length() <= 1000) return trimmed;
 
-        int nl = trimmed.indexOf('\n');
-        String firstLine = nl > 0 ? trimmed.substring(0, nl).trim() : "";
-        int lines = trimmed.split("\n", -1).length;
+        String[] lines = trimmed.split("\n", -1);
+        int totalLines = lines.length;
 
+        // 取前 30 行
+        int headCount = Math.min(30, totalLines / 3);
         StringBuilder sb = new StringBuilder();
-        if (!firstLine.isEmpty()) sb.append(firstLine).append("\n");
-        sb.append("(").append(lines).append(" lines, ").append(trimmed.length()).append(" chars)");
+        for (int i = 0; i < headCount && i < totalLines; i++) {
+            sb.append(lines[i]).append("\n");
+        }
+        sb.append("... (").append(totalLines - headCount).append(" more lines, ")
+                .append(trimmed.length()).append(" total chars) ...\n");
 
-        String result = sb.toString();
-        return result.length() <= SUMMARY_CHARS ? result : result.substring(0, SUMMARY_CHARS) + "...";
+        // 取末 5 行
+        int tailCount = Math.min(5, totalLines - headCount);
+        for (int i = totalLines - tailCount; i < totalLines; i++) {
+            sb.append(lines[i]).append("\n");
+        }
+
+        return sb.toString();
     }
 
     // ===================================================================

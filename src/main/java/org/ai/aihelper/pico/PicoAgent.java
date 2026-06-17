@@ -77,6 +77,11 @@ public class PicoAgent {
     /** 重路由标签：任意模型输出 {@code <reroute>分类</reroute>} 主动要求切换模型 */
     private static final Pattern REROUTE_TAG = Pattern.compile("<reroute>(.*?)</reroute>", Pattern.DOTALL);
 
+    /** 任意工具返回内容进入 history 前的字符上限（参考 clip()：4000） */
+    private static final int MAX_TOOL_OUTPUT_CHARS = 4000;
+    /** renderHistory 中 history section 的总字符预算（超了就从旧条目开始压缩） */
+    private static final int HISTORY_BUDGET_CHARS = 5200;
+
     // ANSI colors
     private static final String C_RESET = "[0m";
     private static final String C_DIM = "[2m";
@@ -133,6 +138,10 @@ public class PicoAgent {
      * 是为了零依赖地保持和 LLM "messages" 数组的 schema 兼容。
      */
     private final List<Map<String, String>> history = new ArrayList<>();
+
+    /** 上一次工具调用（用于拦截完全相同参数的连续重复调用） */
+    private String lastToolName = "";
+    private Map<String, Object> lastToolArgs = null;
 
     /**
      * 构造方法（由 PicoCLI 手动装配；不是 Spring Bean）。
@@ -400,6 +409,7 @@ User: """
             if (rem.find()) {
                 String newRoute = rem.group(1).trim().toLowerCase();
                 if (!newRoute.equals(lastRoute) && isValidRoute(newRoute)) {
+                    runStore.emit("model_parsed", java.util.Map.of("kind", "reroute", "route", newRoute, "raw_preview", truncate(raw, 200)));
                     System.out.println(C_DIM + "── [Reroute] " + C_YELLOW + lastRoute + " → " + newRoute + C_RESET + C_DIM + " ──" + C_RESET);
                     lastRoute = newRoute;
 
@@ -417,13 +427,29 @@ User: """
                 case "error" -> {
                     finishRun("error", parsed.content, null, toolSteps, attempts);
                     history.add(Map.of("role", "assistant", "content", raw));
+                    runStore.emit("model_parsed", java.util.Map.of("kind", "error", "raw_preview", truncate(raw, 200)));
                     return "Error: " + parsed.content;
                 }
                 case "retry" -> {
                     history.add(Map.of("role", "assistant", "content", parsed.content));
+                    runStore.emit("model_parsed", java.util.Map.of("kind", "retry", "reason", parsed.content, "raw_preview", truncate(raw, 200)));
                 }
                 case "tool" -> {
+                    // 完全相同参数的连续重复调用 → 拦截（防止模型卡死在同一页）
+                    if (!lastToolName.isEmpty() && parsed.name.equals(lastToolName)
+                            && parsed.args.equals(lastToolArgs)) {
+                        String msg = "duplicate call blocked: " + parsed.name
+                                + " with identical arguments was just executed; "
+                                + "use different start/end or a different tool";
+                        history.add(Map.of("role", "tool", "name", parsed.name,
+                                "args", String.valueOf(parsed.args), "content", msg));
+                        continue;
+                    }
+                    lastToolName = parsed.name;
+                    lastToolArgs = new LinkedHashMap<>(parsed.args);
+
                     toolSteps++;
+                    runStore.emit("model_parsed", java.util.Map.of("kind", "tool", "name", parsed.name, "raw_preview", truncate(raw, 200)));
 
                     // 提取 <tool> 标签前的自然语言思考，合并进工具结果
                     String thinkingPrefix = "";
@@ -454,6 +480,7 @@ User: """
                 }
                 case "final" -> {
                     history.add(Map.of("role", "assistant", "content", parsed.content));
+                    runStore.emit("model_parsed", java.util.Map.of("kind", "final", "raw_preview", truncate(raw, 200)));
                     finishRun("completed", "final_answer", parsed.content, toolSteps, attempts);
                     return parsed.content;
                 }
@@ -590,9 +617,11 @@ Workspace: """
      * 规则：
      * <ul>
      *   <li>只保留最近 12 条（更早的会被截断，控制 prompt 长度和成本）</li>
-     *   <li>{@code tool} 角色：根据工具名映射成"Knowledge base results:" / "Web search results:" / "Tool result (xxx):"</li>
-     *   <li>非 tool 角色：直接拼成 {@code role: content} 形式</li>
-     *   <li>长内容会被截断（tool 结果截 300 字符，其他 200 字符），防止 prompt 爆炸</li>
+     *   <li>从最新条目开始，在 {@link #HISTORY_BUDGET_CHARS} 预算内保留原文</li>
+     *   <li>预算超了就从旧条目开始压缩：</li>
+     *   <li>{@code read_file} 旧结果 → 折叠为 {@code [path: compressed]}</li>
+     *   <li>{@code search_knowledge} / {@code web_search} → 始终保留原文（知识结果通常短）</li>
+     *   <li>其他旧工具结果截 200 字符，旧消息截 200 字符</li>
      * </ul>
      */
     private static String renderHistory(List<Map<String, String>> history) {
@@ -600,33 +629,77 @@ Workspace: """
         List<Map<String, String>> recent = history.size() > 12
                 ? history.subList(history.size() - 12, history.size())
                 : history;
-        StringBuilder sb = new StringBuilder();
-        for (Map<String, String> item : recent) {
-            String role = item.getOrDefault("role", "");
-            if ("tool".equals(role)) {
-                String name = item.getOrDefault("name", "");
-                String content = item.getOrDefault("content", "");
-                if ("search_knowledge".equals(name)) {
-                    sb.append("Knowledge base results:\n").append(content).append("\n");
-                } else if ("web_search".equals(name)) {
-                    sb.append("Web search results:\n").append(content).append("\n");
-                } else {
-                    // 有思考前缀（"思考\n---\n结果"）时只截断后半段
-                    int sepIdx = content.indexOf("\n---\n");
-                    if (sepIdx > 0) {
-                        String thinking = content.substring(0, sepIdx + 5); // 包括 "---\n"
-                        String rest = content.substring(sepIdx + 5);
-                        sb.append("Tool result (").append(name).append("): ").append(thinking)
-                          .append(truncate(rest, 300)).append("\n");
-                    } else {
-                        sb.append("Tool result (").append(name).append("): ").append(truncate(content, 300)).append("\n");
-                    }
-                }
+
+        // 从最新 → 最旧遍历，在预算内保留原文，超预算的标记压缩
+        int budgetLeft = HISTORY_BUDGET_CHARS;
+        List<Boolean> shouldCompress = new ArrayList<>(recent.size());
+        for (int idx = recent.size() - 1; idx >= 0; idx--) {
+            String full = renderOneItem(recent.get(idx), false);
+            if (full.length() <= budgetLeft) {
+                shouldCompress.add(false);            // 预算够 → 保留原文
+                budgetLeft -= full.length();
             } else {
-                sb.append(role).append(": ").append(truncate(item.getOrDefault("content", ""), 200)).append("\n");
+                shouldCompress.add(true);             // 预算不够 → 标记压缩
+                String cmp = renderOneItem(recent.get(idx), true);
+                budgetLeft -= Math.min(cmp.length(), budgetLeft);
             }
         }
+        // shouldCompress 现在是新→旧的标记，反转成旧→新
+        Collections.reverse(shouldCompress);
+
+        // 按标记渲染
+        StringBuilder sb = new StringBuilder();
+        for (int idx = 0; idx < recent.size(); idx++) {
+            sb.append(renderOneItem(recent.get(idx), shouldCompress.get(idx)));
+        }
         return sb.toString();
+    }
+
+    /** 渲染单条 history 条目（compressed=true 时压缩后返回） */
+    private static String renderOneItem(Map<String, String> item, boolean compressed) {
+        String role = item.getOrDefault("role", "");
+        if ("tool".equals(role)) {
+            String name = item.getOrDefault("name", "");
+            String content = item.getOrDefault("content", "");
+
+            // 知识/搜索结果始终保留原文（它们通常短）
+            if ("search_knowledge".equals(name)) {
+                return compressed ? "(Knowledge base results)\n"
+                        : "Knowledge base results:\n" + content + "\n";
+            }
+            if ("web_search".equals(name)) {
+                return compressed ? "(Web search results)\n"
+                        : "Web search results:\n" + content + "\n";
+            }
+
+            if (compressed) {
+                if ("read_file".equals(name)) {
+                    int nl = content.indexOf('\n');
+                    String pathLine = nl > 0 ? content.substring(0, nl) : content;
+                    return "Tool result (" + name + "): " + truncate(pathLine, 80) + " [compressed]\n";
+                }
+                int sepIdx = content.indexOf("\n---\n");
+                if (sepIdx > 0) {
+                    return "Tool result (" + name + "): " + content.substring(0, sepIdx)
+                            + "\n---\n" + truncate(content.substring(sepIdx + 5), 200) + "\n";
+                }
+                return "Tool result (" + name + "): " + truncate(content, 200) + "\n";
+            }
+
+            // full
+            int sepIdx = content.indexOf("\n---\n");
+            if (sepIdx > 0) {
+                return "Tool result (" + name + "): " + content.substring(0, sepIdx)
+                        + "\n---\n" + content.substring(sepIdx + 5) + "\n";
+            }
+            return "Tool result (" + name + "): " + content + "\n";
+        }
+
+        // user / assistant
+        if (compressed) {
+            return role + ": " + truncate(item.getOrDefault("content", ""), 200) + "\n";
+        }
+        return role + ": " + item.getOrDefault("content", "") + "\n";
     }
 
     // ===================================================================
@@ -789,15 +862,15 @@ Workspace: """
                     String summary = SessionMemory.summarizeContent(result);
                     memory.setFileSummary(canonicalPath, summary);
                     memory.appendNote(summary, Set.of(relativePath), relativePath);
-                    // 历史里只留摘要，全文存记忆里；模型可以通过 prompt 中的 file_summaries 看到
-                    return summary;
+                    // 完整内容返回给 LLM（clip 兜底），摘要存 memory 供后续 history 压缩复用
+                    return clip(result);
                 } else if ("write_file".equals(name) || "patch_file".equals(name)) {
                     memory.rememberFile(relativePath);
                     memory.invalidateFileSummary(canonicalPath);
                 }
             }
 
-            return result;
+            return clip(result);
         } catch (Exception e) {
             return "error: tool " + name + " failed: " + e.getMessage();
         }
@@ -849,7 +922,7 @@ Workspace: """
             String output = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
             int exitCode = process.exitValue();
             String result = "exit code: " + exitCode + " (" + elapsed + "ms)\n" + output.trim();
-            return result;
+            return clip(result);
         } catch (Exception e) {
             return "error: shell execution failed - " + e.getMessage();
         }
@@ -878,5 +951,13 @@ Workspace: """
     private static String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() > max ? s.substring(0, max) + "..." : s;
+    }
+
+    /** 工具输出字符上限裁剪。超过 {@link #MAX_TOOL_OUTPUT_CHARS} 的文本被截断。 */
+    private static String clip(String s) {
+        if (s == null) return "";
+        if (s.length() <= MAX_TOOL_OUTPUT_CHARS) return s;
+        return s.substring(0, MAX_TOOL_OUTPUT_CHARS)
+                + "\n... (truncated at " + MAX_TOOL_OUTPUT_CHARS + " chars)";
     }
 }

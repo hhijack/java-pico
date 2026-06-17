@@ -13,11 +13,13 @@ import subprocess
 import sys
 import os
 import tempfile
+import datetime
 from pathlib import Path
 
 BENCHMARK_FILE = Path(__file__).parent / "coding_tasks.json"
 ROOT_DIR = Path(__file__).parent.parent
 WORKSPACE_DIR = ROOT_DIR / "benchmarks" / "workspace"
+SESSION_DIR = None  # --all 时设置为单次会话目录
 
 
 def load_tasks():
@@ -43,15 +45,19 @@ def list_tasks():
 
 
 def setup_fixture(task):
-    """复制 fixture 到独立工作目录"""
+    """复制 fixture 到会话目录下的独立任务目录"""
     src = ROOT_DIR / task["fixture_repo"]
     if not src.exists():
         print(f"  ❌ Fixture not found: {src}")
         return None
 
-    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-    dst = Path(tempfile.mkdtemp(prefix=f"{task['id']}_", dir=WORKSPACE_DIR))
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    dst = SESSION_DIR / task["id"]
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.is_dir():
+            shutil.copytree(item, dst / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dst / item.name)
     return dst
 
 
@@ -172,6 +178,7 @@ def run_task(task, auto=False):
 
 
 def run_all(auto=False):
+    print(f"\n📁 Session: {SESSION_DIR}\n")
     results = []
     for t in load_tasks():
         results.append(run_task(t, auto=auto))
@@ -220,6 +227,13 @@ if __name__ == "__main__":
     args = filtered
 
     results = None
+
+    # 统一会话目录：一次 run.py 调用的所有任务都在同一个目录下
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    SESSION_DIR = WORKSPACE_DIR / f"run_{timestamp}"
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\n📁 Session: {SESSION_DIR}\n")
+
     if not args:
         list_tasks()
     elif args[0] == "--all":

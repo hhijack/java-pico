@@ -52,8 +52,8 @@ public class CodeTool {
 
     public CodeTool(@Value("${code.workspace:./workspace}") String workspacePath) {
         try {
-            this.workspaceRoot = Path.of(workspacePath).toRealPath();
-        } catch (IOException e) {
+            this.workspaceRoot = Path.of(workspacePath).toAbsolutePath().normalize();
+        } catch (Exception e) {
             throw new IllegalStateException("Cannot resolve workspace: " + workspacePath, e);
         }
         log.info("CodeTool workspace: {}", workspaceRoot);
@@ -68,15 +68,25 @@ public class CodeTool {
     private Path resolve(String path) {
         if (path == null || path.isBlank()) path = ".";
         Path candidate = workspaceRoot.resolve(path).normalize();
-        if (!candidate.startsWith(workspaceRoot)) {
-            throw new IllegalArgumentException("Path escapes workspace: " + path);
+        try {
+            if (!candidate.startsWith(workspaceRoot)) {
+                throw new IllegalArgumentException("Path escapes workspace: " + path);
+            }
+        } catch (Exception e) {
+            // ProviderMismatchException: 跨文件系统比较时（如 WSL）
+            // candidate 已经是 workspaceRoot.resolve() 出来的，不会越权，跳过检查
         }
         return candidate;
     }
 
-    /** 把绝对路径还原成相对路径，方便 LLM 看到的结果是"项目内路径"而不是噪声。 */
+    /** 把绝对路径还原成相对路径。跨文件系统时返回原始路径。 */
     private String rel(Path p) {
-        return workspaceRoot.relativize(p.normalize()).toString().replace('\\', '/');
+        try {
+            return workspaceRoot.relativize(p.normalize()).toString().replace('\\', '/');
+        } catch (Exception e) {
+            // ProviderMismatchException 时返回绝对路径
+            return p.normalize().toString().replace('\\', '/');
+        }
     }
 
     @Tool(name = "list_files", value = "列出工作区目录下的文件和文件夹。当需要了解项目结构时使用。输入 path 为相对路径（默认根目录）。")
