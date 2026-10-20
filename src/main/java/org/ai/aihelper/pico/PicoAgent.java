@@ -81,6 +81,8 @@ public class PicoAgent {
     private static final int MAX_TOOL_OUTPUT_CHARS = 4000;
     /** renderHistory 中 history section 的总字符预算（超了就从旧条目开始压缩） */
     private static final int HISTORY_BUDGET_CHARS = 5200;
+    /** 总 prompt 字符预算（超了按 relevant_memory → history → memory → prefix 压缩） */
+    private static final int PROMPT_BUDGET_CHARS = 12000;
 
     // ANSI colors
     private static final String C_RESET = "[0m";
@@ -540,23 +542,62 @@ User: """
      *   <li><b>输出协议</b>：强制 EXACTLY 输出 {@code <tool>} / {@code <final>} 之一（这是 Agent 循环能跑通的前提）</li>
      *   <li><b>工具清单</b>：所有可用工具的 JSON Schema 简版</li>
      *   <li><b>工作区快照</b>：让 LLM 知道当前有哪些文件可操作</li>
+     *   <li><b>文件摘要 + 相关笔记</b>：记忆层注入</li>
      *   <li><b>历史消息</b>：最近 12 条（renderHistory 控制）</li>
-     *   <li><b>当前用户请求</b>：用 {@code User: ...} 引导 LLM 回答</li>
+     *   <li><b>当前用户请求</b>：用 {@code User: ...} 引导 LLM 回答，永不压缩</li>
      * </ol>
      *
-     * <h3>为什么用 text prompt 而非 ChatML/JSON Schema tools？</h3>
-     * DeepSeek-V4 兼容 OpenAI ChatML 格式，但其原生 function-calling 协议在多轮工具调用场景下
-     * 行为不稳定。本项目刻意把所有"工具调用"压成 XML 标签 + JSON 字符串，让 LLM 在一次完整上下文里
-     * 自由决定何时调用、调用哪个、自己推理，再由 {@link #parse} 解析回来 —— 实际效果更稳。
+     * <p>总 prompt 超过 {@link #PROMPT_BUDGET_CHARS} 时，
+     * 按 relevant_memory → history → memory → prefix 顺序压缩。
      *
-     * @param userMessage 当前用户消息（同时也作为 history 的最新一条；保留两个参数仅为阅读清晰）
-     * @param history     当前会话的全部历史（含 user / assistant / tool 三种 role）
+     * @param userMessage 当前用户消息
+     * @param history     当前会话的全部历史
      * @return 喂给 {@link DeepSeekClient#complete} 的完整 prompt
      */
     private String buildPrompt(String userMessage, List<Map<String, String>> history) {
         String workspace = workspaceRoot.toAbsolutePath().normalize().toString();
         String snapshot = workspaceSnapshot();
-        String h = renderHistory(history);
+        String prefix = buildPrefix(workspace, snapshot);
+        String fileSummaries = memory.renderMemoryText(workspaceRoot);
+        String relevantMem = memory.renderRelevantMemory(userMessage);
+        String histStr = renderHistory(history);
+        String userReq = "\nUser: " + userMessage + "\n";
+
+        // Level 0: 全部保留
+        String prompt = prefix + "\n" + fileSummaries + relevantMem + "History:\n" + histStr + userReq;
+        if (prompt.length() <= PROMPT_BUDGET_CHARS) return prompt;
+
+        // Level 1: 裁掉 relevant_memory（优先级最低，优先压缩）
+        prompt = prefix + "\n" + fileSummaries + "History:\n" + histStr + userReq;
+        if (prompt.length() <= PROMPT_BUDGET_CHARS) return prompt;
+
+        // Level 2: 收紧 history 预算
+        int overBy = prompt.length() - PROMPT_BUDGET_CHARS;
+        histStr = renderHistory(history, Math.max(800, HISTORY_BUDGET_CHARS - overBy));
+        prompt = prefix + "\n" + fileSummaries + "History:\n" + histStr + userReq;
+        if (prompt.length() <= PROMPT_BUDGET_CHARS) return prompt;
+
+        // Level 3: 截断 file_summaries
+        int fixedLen = prefix.length() + "\n".length()
+                + "History:\n".length() + histStr.length() + userReq.length();
+        int fsBudget = PROMPT_BUDGET_CHARS - fixedLen;
+        if (fsBudget > 120) {
+            prompt = prefix + "\n" + truncate(fileSummaries, fsBudget)
+                    + "History:\n" + histStr + userReq;
+            return prompt;
+        }
+
+        // Level 4: 连 file_summaries 也扔掉，进一步收紧 history
+        int histBudget = PROMPT_BUDGET_CHARS
+                - prefix.length() - "\n".length()
+                - "History:\n".length() - userReq.length();
+        histStr = renderHistory(history, Math.max(300, histBudget));
+        prompt = prefix + "\n" + "History:\n" + histStr + userReq;
+        return prompt;
+    }
+
+    /** 构建固定的系统提示 + 工作区信息段（prefix + workspace + files snapshot） */
+    private String buildPrefix(String workspace, String snapshot) {
         return """
 You are java-pico, an AI assistant specialized in Java interview preparation.
 You have a KNOWLEDGE BASE with high-quality Java interview content (JVM, JUC, Spring, MySQL, Redis, MQ, etc.).
@@ -591,11 +632,7 @@ Reply with one of:
 
 Workspace: """
                 + workspace
-                + "\nFiles:\n" + snapshot
-                + "\n" + memory.renderMemoryText(workspaceRoot)
-                + memory.renderRelevantMemory(userMessage)
-                + "History:\n" + h
-                + "\nUser: " + userMessage + "\n";
+                + "\nFiles:\n" + snapshot;
     }
 
     /**
@@ -625,29 +662,44 @@ Workspace: """
      * </ul>
      */
     private static String renderHistory(List<Map<String, String>> history) {
+        return renderHistory(history, HISTORY_BUDGET_CHARS);
+    }
+
+    /**
+     * 把结构化 history 渲染成可喂给 LLM 的纯文本，使用指定字符预算。
+     * <p>
+     * 规则：
+     * <ul>
+     *   <li>只保留最近 12 条（更早的会被截断，控制 prompt 长度和成本）</li>
+     *   <li>从最新条目开始，在 {@code budget} 预算内保留原文</li>
+     *   <li>预算超了就从旧条目开始压缩：</li>
+     *   <li>{@code read_file} 旧结果 → 折叠为 {@code [path: compressed]}</li>
+     *   <li>{@code search_knowledge} / {@code web_search} → 始终保留原文（知识结果通常短）</li>
+     *   <li>其他旧工具结果截 200 字符，旧消息截 200 字符</li>
+     * </ul>
+     */
+    private static String renderHistory(List<Map<String, String>> history, int budget) {
         if (history.isEmpty()) return "(empty)";
         List<Map<String, String>> recent = history.size() > 12
                 ? history.subList(history.size() - 12, history.size())
                 : history;
 
         // 从最新 → 最旧遍历，在预算内保留原文，超预算的标记压缩
-        int budgetLeft = HISTORY_BUDGET_CHARS;
+        int budgetLeft = budget;
         List<Boolean> shouldCompress = new ArrayList<>(recent.size());
         for (int idx = recent.size() - 1; idx >= 0; idx--) {
             String full = renderOneItem(recent.get(idx), false);
             if (full.length() <= budgetLeft) {
-                shouldCompress.add(false);            // 预算够 → 保留原文
+                shouldCompress.add(false);
                 budgetLeft -= full.length();
             } else {
-                shouldCompress.add(true);             // 预算不够 → 标记压缩
+                shouldCompress.add(true);
                 String cmp = renderOneItem(recent.get(idx), true);
                 budgetLeft -= Math.min(cmp.length(), budgetLeft);
             }
         }
-        // shouldCompress 现在是新→旧的标记，反转成旧→新
         Collections.reverse(shouldCompress);
 
-        // 按标记渲染
         StringBuilder sb = new StringBuilder();
         for (int idx = 0; idx < recent.size(); idx++) {
             sb.append(renderOneItem(recent.get(idx), shouldCompress.get(idx)));
